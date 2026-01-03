@@ -1,6 +1,6 @@
 const std = @import("std");
 const net = std.net;
-const Proxy = @import("proxy").Proxy;
+const Proxy = @import("proxy.zig").Proxy;
 const loadConfig = @import("config.zig").loadConfig;
 
 pub fn main() !void {
@@ -9,7 +9,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // 加载配置
-    const cfg = try loadConfig("config/config.toml", allocator);
+    const cfg = try loadConfig("config/config.json", allocator);
     defer cfg.deinit(allocator);
 
     std.log.info("Starting StarryPy Zig proxy...", .{});

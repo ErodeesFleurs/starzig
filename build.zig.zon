@@ -3,12 +3,7 @@
     .version = "0.0.0",
     .fingerprint = 0x8bb4a566fd7a0d5a, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
-    .dependencies = .{
-        .toml = .{
-            .url = "git+https://github.com/sam701/zig-toml#44318b82b961cb3c09a23924c2de80b9192213bd",
-            .hash = "toml-0.3.0-bV14BeiEAQBmkb-ywYhHxpBdt52ztkRmf-EVyEFbrTxt",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

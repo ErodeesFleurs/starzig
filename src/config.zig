@@ -1,5 +1,4 @@
 const std = @import("std");
-const toml = @import("toml");
 
 pub const Config = struct {
     proxy_port: u16,
@@ -18,22 +17,23 @@ pub const Config = struct {
 pub fn loadConfig(path: []const u8, allocator: std.mem.Allocator) !Config {
     const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
-    const file_size = try file.getEndPos();
-    const buffer = try allocator.alloc(u8, file_size);
+
+    const buffer = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
     defer allocator.free(buffer);
-    _ = try file.readAll(buffer);
-    const doc = try toml.parse(allocator, buffer);
-    defer doc.deinit();
-    const proxy_port = try doc.getInt("proxy_port");
-    const backend_host = try doc.getStringAlloc(allocator, "backend_host");
-    const backend_port = try doc.getInt("backend_port");
-    const motd = try doc.getStringAlloc(allocator, "motd");
-    const owner_uuid = try doc.getStringAlloc(allocator, "owner_uuid");
-    return Config{
-        .proxy_port = @as(u16, proxy_port),
-        .backend_host = backend_host,
-        .backend_port = @as(u16, backend_port),
-        .motd = motd,
-        .owner_uuid = owner_uuid,
-    };
+
+    const parser = try std.json.parseFromSlice(Config, allocator, buffer, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parser.deinit();
+
+    var cfg = parser.value;
+    const host_copy = try allocator.dupe(u8, cfg.backend_host);
+    const motd_copy = try allocator.dupe(u8, cfg.motd);
+    const owner_uuid_copy = try allocator.dupe(u8, cfg.owner_uuid);
+
+    cfg.backend_host = host_copy;
+    cfg.motd = motd_copy;
+    cfg.owner_uuid = owner_uuid_copy;
+
+    return cfg;
 }

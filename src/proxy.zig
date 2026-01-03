@@ -1,14 +1,15 @@
 const std = @import("std");
 const net = std.net;
-const Config = @import("config").Config;
-const PacketHandler = @import("packets").PacketHandler;
+const Config = @import("config.zig").Config;
+const PacketHandler = @import("packets.zig").PacketHandler;
+const Direction = @import("packets.zig").Direction;
 
 pub const Proxy = struct {
     allocator: std.mem.Allocator,
     config: Config,
     server: net.Server,
     packet_handler: PacketHandler,
-    clients: std.AutoHashMap(net.StreamServer.Connection, ClientContext),
+    clients: std.AutoHashMap(net.Server.Connection, ClientContext),
 
     const ClientContext = struct {
         client_stream: net.Stream,
@@ -20,18 +21,16 @@ pub const Proxy = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Proxy {
         const address = try net.Address.parseIp("0.0.0.0", config.proxy_port);
-        var server = net.StreamServer.init(.{
+        const server = try address.listen(.{
             .reuse_address = true,
         });
-
-        try server.listen(address);
 
         return Proxy{
             .allocator = allocator,
             .config = config,
             .server = server,
-            .packet_handler = try PacketHandler.init(allocator),
-            .clients = std.AutoHashMap(net.StreamServer.Connection, ClientContext).init(allocator),
+            .packet_handler = PacketHandler.init(allocator),
+            .clients = std.AutoHashMap(net.Server.Connection, ClientContext).init(allocator),
         };
     }
 
@@ -54,7 +53,7 @@ pub const Proxy = struct {
 
         while (true) {
             const connection = try self.server.accept();
-            std.log.info("New connection from {s}", .{connection.address});
+            std.log.info("New connection from {any}", .{connection.address});
 
             // 为每个连接启动一个协程/线程
             var handle = try std.Thread.spawn(.{}, handleConnection, .{
@@ -67,7 +66,7 @@ pub const Proxy = struct {
     fn handleConnection(
         allocator: std.mem.Allocator,
         config: Config,
-        client_conn: net.StreamServer.Connection,
+        client_conn: net.Server.Connection,
         packet_handler: *PacketHandler,
     ) !void {
         defer client_conn.stream.close();
@@ -81,43 +80,43 @@ pub const Proxy = struct {
 
         // 创建双向转发
         var client_to_server = try std.Thread.spawn(.{}, forwardData, .{
-            .source = client_conn.stream,
-            .dest = server_stream,
-            .direction = .client_to_server,
-            .packet_handler = packet_handler,
+            client_conn.stream,
+            server_stream,
+            Direction.ClientToServer,
+            packet_handler,
         });
 
         var server_to_client = try std.Thread.spawn(.{}, forwardData, .{
-            .source = server_stream,
-            .dest = client_conn.stream,
-            .direction = .server_to_client,
-            .packet_handler = packet_handler,
+            server_stream,
+            client_conn.stream,
+            Direction.ServerToClient,
+            packet_handler,
         });
 
         client_to_server.join();
         server_to_client.join();
     }
 
-    fn forwardData(args: struct {
+    fn forwardData(
         source: net.Stream,
         dest: net.Stream,
-        direction: enum { client_to_server, server_to_client },
+        direction: Direction,
         packet_handler: *PacketHandler,
-    }) !void {
+    ) !void {
         var buffer: [4096]u8 = undefined;
 
         while (true) {
-            const bytes_read = try args.source.read(&buffer);
+            const bytes_read = try source.read(&buffer);
             if (bytes_read == 0) break;
 
             // 处理数据包（这里可以添加协议解析和修改）
-            const processed_data = try args.packet_handler.process(
+            const processed_data = try packet_handler.process(
                 buffer[0..bytes_read],
-                args.direction,
+                direction,
             );
 
             // 转发处理后的数据
-            try args.dest.writeAll(processed_data);
+            try dest.writeAll(processed_data);
         }
     }
 };

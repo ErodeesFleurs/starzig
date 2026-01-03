@@ -1,0 +1,7 @@
+{
+  "proxy_port": 21024,
+  "backend_host": "127.0.0.1",
+  "backend_port": 21025,
+  "motd": "^cyan;nothing to sat.^reset;",
+  "owner_uuid": ""
+}

@@ -1,24 +1,24 @@
 const std = @import("std");
 
-const Direction = enum {
+pub const Direction = enum {
     ClientToServer,
     ServerToClient,
 };
 
-pub const PackedHandler = struct {
+pub const PacketHandler = struct {
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) PackedHandler {
-        return PackedHandler{
+    pub fn init(allocator: std.mem.Allocator) PacketHandler {
+        return PacketHandler{
             .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *PackedHandler) void {
+    pub fn deinit(self: *PacketHandler) void {
         _ = self;
     }
 
-    pub fn process(self: *PackedHandler, data: []const u8, direction: Direction) !void {
+    pub fn process(self: *PacketHandler, data: []const u8, direction: Direction) ![]const u8 {
         _ = self;
         _ = direction;
         return data;

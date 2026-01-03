@@ -15,11 +15,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const toml_mod = b.dependency("toml", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     const exe = b.addExecutable(.{
         .name = "starzig",
         .root_module = b.createModule(.{
@@ -31,8 +26,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-
-    exe.root_module.addImport("toml", toml_mod.module("toml"));
 
     b.installArtifact(exe);
     const run_step = b.step("run", "Run the app");
