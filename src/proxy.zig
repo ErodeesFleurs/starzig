@@ -293,8 +293,8 @@ pub const ConnectionContext = struct {
 
         while (true) {
             const header = packet.PacketHeader.decode(reader) catch break;
+            std.log.info("packet_type: {s} packet_size: {d}", .{ @tagName(header.packet_type), header.payload_size });
 
-            // Allocate payload buffer
             const is_compressed = header.payload_size < 0;
             const payload_len = if (is_compressed)
                 @as(usize, @intCast(@abs(header.payload_size)))

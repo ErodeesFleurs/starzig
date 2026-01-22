@@ -27,6 +27,7 @@
 
           buildInputs = with pkgs; [
             zstd
+            zlib
             zig
           ];
 
