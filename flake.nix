@@ -22,9 +22,20 @@
       in
       {
         devShells.default = pkgs.mkShell {
+          nativeBuildInputs = [
+          ];
+
           buildInputs = with pkgs; [
+            zstd
             zig
           ];
+
+          packages = [
+          ];
+
+          shellHook = ''
+            export ZIG_GLOBAL_CACHE_DIR=".zig-cache/"
+          '';
         };
       }
     );
