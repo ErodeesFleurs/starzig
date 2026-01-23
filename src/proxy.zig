@@ -102,8 +102,10 @@ pub const ConnectionContext = struct {
     server: net.Stream,
     state: ConnectionState,
     compressed: bool,
-    decompressor: compression.Decompressor,
-    compressor: compression.Compressor,
+    decompressor: ?*compression.ZstdStreamDecompressor,
+    compressor: ?*compression.ZstdStreamCompressor,
+    server_decompressor: ?*compression.ZstdStreamDecompressor,
+    server_compressor: ?*compression.ZstdStreamCompressor,
 
     // Player info
     player_name: ?[]u8 = null,
@@ -123,15 +125,19 @@ pub const ConnectionContext = struct {
             .server = server,
             .state = .handshake,
             .compressed = false,
-            .decompressor = try compression.Decompressor.init(),
-            .compressor = try compression.Compressor.init(),
+            .decompressor = null,
+            .compressor = null,
+            .server_decompressor = null,
+            .server_compressor = null,
             .entities = std.AutoHashMap(u64, *plugins.entity_manager.EntityInfo).init(allocator),
         };
     }
 
     fn deinit(self: *ConnectionContext) void {
-        self.decompressor.deinit();
-        self.compressor.deinit();
+        if (self.decompressor) |d| d.deinit();
+        if (self.compressor) |c| c.deinit();
+        if (self.server_decompressor) |d| d.deinit();
+        if (self.server_compressor) |c| c.deinit();
         if (self.player_name) |name| self.allocator.free(name);
         if (self.world_id) |wid| self.allocator.free(wid);
         if (self.last_msg_from) |lmf| self.allocator.free(lmf);
@@ -139,31 +145,19 @@ pub const ConnectionContext = struct {
     }
 
     pub fn sendToClient(self: *ConnectionContext, p: *packet.Packet) !void {
-        const writer = std.io.AnyWriter{
-            .context = &self.client,
-            .writeFn = struct {
-                fn write(ptr: *const anyopaque, src: []const u8) anyerror!usize {
-                    const s: *const net.Stream = @ptrCast(@alignCast(ptr));
-                    return s.write(src);
-                }
-            }.write,
-        };
-        try p.header.encode(writer);
-        try self.client.writeAll(p.payload);
+        var bw_buf: [4096]u8 = undefined;
+        var bw = self.client.writer(&bw_buf);
+        const current_writer = &bw.interface;
+        try p.header.encode(current_writer);
+        try current_writer.writeAll(p.payload);
     }
 
     pub fn sendToServer(self: *ConnectionContext, p: *packet.Packet) !void {
-        const writer = std.io.AnyWriter{
-            .context = &self.server,
-            .writeFn = struct {
-                fn write(ptr: *const anyopaque, src: []const u8) anyerror!usize {
-                    const s: *const net.Stream = @ptrCast(@alignCast(ptr));
-                    return s.write(src);
-                }
-            }.write,
-        };
-        try p.header.encode(writer);
-        try self.server.writeAll(p.payload);
+        var bw_buf: [4096]u8 = undefined;
+        var bw = self.server.writer(&bw_buf);
+        const current_writer = &bw.interface;
+        try p.header.encode(current_writer);
+        try current_writer.writeAll(p.payload);
     }
 
     pub fn sendMessage(self: *ConnectionContext, message: []const u8) !void {
@@ -227,14 +221,14 @@ pub const ConnectionContext = struct {
         defer buf.deinit(self.allocator);
         const writer = buf.writer(self.allocator);
 
-        try writer.writeByte(1); // WarpType.TO_WORLD
-        try writer.writeByte(2); // WarpWorldType.PLAYER_WORLD
+        try writer.writeAll(&[_]u8{1}); // WarpType.TO_WORLD
+        try writer.writeAll(&[_]u8{2}); // WarpWorldType.PLAYER_WORLD
         var zero_uuid = [_]u8{0} ** 16;
         try writer.writeAll(&zero_uuid);
-        try writer.writeByte(2); // flag 2
+        try writer.writeAll(&[_]u8{2}); // flag 2
         try writer.writeInt(u32, @bitCast(pos[0]), .big);
         try writer.writeInt(u32, @bitCast(pos[1]), .big);
-        try writer.writeByte(0); // trailing junk/zero
+        try writer.writeAll(&[_]u8{0}); // trailing junk/zero
 
         try self.injectToClient(.player_warp, buf.items);
     }
@@ -272,28 +266,16 @@ pub const ConnectionContext = struct {
         const from_stream = if (from == .client) self.client else self.server;
         const to_stream = if (to == .client) self.client else self.server;
 
-        const reader = std.io.AnyReader{
-            .context = &from_stream,
-            .readFn = struct {
-                fn read(ptr: *const anyopaque, dest: []u8) anyerror!usize {
-                    const s: *const net.Stream = @ptrCast(@alignCast(ptr));
-                    return s.read(dest);
-                }
-            }.read,
-        };
-        const writer = std.io.AnyWriter{
-            .context = &to_stream,
-            .writeFn = struct {
-                fn write(ptr: *const anyopaque, src: []const u8) anyerror!usize {
-                    const s: *const net.Stream = @ptrCast(@alignCast(ptr));
-                    return s.write(src);
-                }
-            }.write,
-        };
+        var br_buf: [4096]u8 = undefined;
+        var bw_buf: [4096]u8 = undefined;
+        var br = from_stream.reader(&br_buf);
+        var bw = to_stream.writer(&bw_buf);
+        var current_reader = &br.file_reader.interface;
+        var current_writer = &bw.interface;
 
         while (true) {
-            const header = packet.PacketHeader.decode(reader) catch break;
-            std.log.info("packet_type: {s} packet_size: {d}", .{ @tagName(header.packet_type), header.payload_size });
+            const header = packet.PacketHeader.decode(current_reader) catch break;
+            std.log.info("packet_type: {s} packet_size: {d} direction: {any}", .{ @tagName(header.packet_type), header.payload_size, from });
 
             const is_compressed = header.payload_size < 0;
             const payload_len = if (is_compressed)
@@ -303,10 +285,12 @@ pub const ConnectionContext = struct {
 
             const raw_payload = try self.allocator.alloc(u8, payload_len);
             defer self.allocator.free(raw_payload);
-            try reader.readNoEof(raw_payload);
+            var fw = std.io.Writer.fixed(raw_payload);
+            const amt_read = try current_reader.vtable.stream(current_reader, &fw, .limited(payload_len));
+            if (amt_read < payload_len) return error.EndOfStream;
 
             const payload = if (is_compressed)
-                try self.decompressor.decompress(self.allocator, raw_payload)
+                try compression.decompressZlib(self.allocator, raw_payload)
             else
                 try self.allocator.dupe(u8, raw_payload);
 
@@ -352,8 +336,126 @@ pub const ConnectionContext = struct {
             const allowed = try plugins.Registry.callOnPacket(self, &p);
 
             if (allowed) {
-                try p.header.encode(writer);
-                try writer.writeAll(p.payload);
+                try p.header.encode(current_writer);
+                try current_writer.writeAll(p.payload);
+            }
+
+            // Zstd stream transition
+            if (p.header.packet_type == .protocol_response) {
+                std.log.info("Protocol response received, starting Zstd stream", .{});
+                if (from == .server) {
+                    self.server_decompressor = try compression.ZstdStreamDecompressor.init(self.allocator);
+                    const WrappedReader = struct {
+                        inner: *std.io.Reader,
+                        decompressor: *compression.ZstdStreamDecompressor,
+                        interface: std.io.Reader = undefined,
+
+                        fn stream(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) error{ EndOfStream, ReadFailed, WriteFailed }!usize {
+                            const self_ptr: *@This() = @fieldParentPtr("interface", r);
+                            var buf: [4096]u8 = undefined;
+                            const to_read = limit.slice(&buf);
+                            const n = self_ptr.decompressor.read(self_ptr.inner, to_read) catch return error.ReadFailed;
+                            return w.write(to_read[0..n]) catch return error.WriteFailed;
+                        }
+                    };
+                    const wr = try self.allocator.create(WrappedReader);
+                    wr.* = .{
+                        .inner = current_reader,
+                        .decompressor = self.server_decompressor.?,
+                        .interface = .{
+                            .vtable = &.{ .stream = WrappedReader.stream },
+                            .buffer = &[_]u8{},
+                            .end = 0,
+                            .seek = 0,
+                        },
+                    };
+                    current_reader = &wr.interface;
+
+                    self.compressor = try compression.ZstdStreamCompressor.init(self.allocator);
+                    const WrappedWriter = struct {
+                        inner: *std.io.Writer,
+                        compressor: *compression.ZstdStreamCompressor,
+                        interface: std.io.Writer = undefined,
+
+                        fn drain(w: *std.io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+                            const self_ptr: *@This() = @fieldParentPtr("interface", w);
+                            var total: usize = 0;
+                            for (data) |slice| {
+                                total += self_ptr.compressor.write(self_ptr.inner, slice) catch return error.WriteFailed;
+                            }
+                            if (splat > 0) {
+                                const last = data[data.len - 1];
+                                for (0..splat) |_| {
+                                    _ = self_ptr.compressor.write(self_ptr.inner, last) catch return error.WriteFailed;
+                                }
+                            }
+                            return total;
+                        }
+                    };
+                    const ww = try self.allocator.create(WrappedWriter);
+                    ww.* = .{
+                        .inner = current_writer,
+                        .compressor = self.compressor.?,
+                        .interface = .{ .vtable = &.{ .drain = WrappedWriter.drain }, .buffer = &[_]u8{}, .end = 0 },
+                    };
+                    current_writer = &ww.interface;
+                } else {
+                    self.decompressor = try compression.ZstdStreamDecompressor.init(self.allocator);
+                    const WrappedReader = struct {
+                        inner: *std.io.Reader,
+                        decompressor: *compression.ZstdStreamDecompressor,
+                        interface: std.io.Reader = undefined,
+
+                        fn stream(r: *std.io.Reader, w: *std.io.Writer, limit: std.io.Limit) error{ EndOfStream, ReadFailed, WriteFailed }!usize {
+                            const self_ptr: *@This() = @fieldParentPtr("interface", r);
+                            var buf: [4096]u8 = undefined;
+                            const to_read = limit.slice(&buf);
+                            const n = self_ptr.decompressor.read(self_ptr.inner, to_read) catch return error.ReadFailed;
+                            return w.write(to_read[0..n]) catch return error.WriteFailed;
+                        }
+                    };
+                    const wr = try self.allocator.create(WrappedReader);
+                    wr.* = .{
+                        .inner = current_reader,
+                        .decompressor = self.decompressor.?,
+                        .interface = .{
+                            .vtable = &.{ .stream = WrappedReader.stream },
+                            .buffer = &[_]u8{},
+                            .end = 0,
+                            .seek = 0,
+                        },
+                    };
+                    current_reader = &wr.interface;
+
+                    self.server_compressor = try compression.ZstdStreamCompressor.init(self.allocator);
+                    const WrappedWriter = struct {
+                        inner: *std.io.Writer,
+                        compressor: *compression.ZstdStreamCompressor,
+                        interface: std.io.Writer = undefined,
+
+                        fn drain(w: *std.io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+                            const self_ptr: *@This() = @fieldParentPtr("interface", w);
+                            var total: usize = 0;
+                            for (data) |slice| {
+                                total += self_ptr.compressor.write(self_ptr.inner, slice) catch return error.WriteFailed;
+                            }
+                            if (splat > 0) {
+                                const last = data[data.len - 1];
+                                for (0..splat) |_| {
+                                    _ = self_ptr.compressor.write(self_ptr.inner, last) catch return error.WriteFailed;
+                                }
+                            }
+                            return total;
+                        }
+                    };
+                    const ww = try self.allocator.create(WrappedWriter);
+                    ww.* = .{
+                        .inner = current_writer,
+                        .compressor = self.server_compressor.?,
+                        .interface = .{ .vtable = &.{ .drain = WrappedWriter.drain }, .buffer = &[_]u8{}, .end = 0 },
+                    };
+                    current_writer = &ww.interface;
+                }
             }
         }
     }

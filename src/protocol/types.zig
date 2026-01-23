@@ -6,13 +6,19 @@ pub const StarString = struct {
         const length = try vlq.Vlq.decode(reader);
         const buf = try allocator.alloc(u8, length);
         errdefer allocator.free(buf);
-        try reader.readNoEof(buf);
+        var total: usize = 0;
+        while (total < length) {
+            const n = try reader.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        if (total < length) return error.EndOfStream;
         return buf;
     }
 
     pub fn encode(writer: anytype, value: []const u8) !void {
         try vlq.Vlq.encode(writer, value.len);
-        try writer.writeAll(value);
+        _ = try writer.write(value);
     }
 };
 
@@ -21,13 +27,19 @@ pub const StarByteArray = struct {
         const length = try vlq.Vlq.decode(reader);
         const buf = try allocator.alloc(u8, length);
         errdefer allocator.free(buf);
-        try reader.readNoEof(buf);
+        var total: usize = 0;
+        while (total < length) {
+            const n = try reader.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        if (total < length) return error.EndOfStream;
         return buf;
     }
 
     pub fn encode(writer: anytype, value: []const u8) !void {
         try vlq.Vlq.encode(writer, value.len);
-        try writer.writeAll(value);
+        _ = try writer.write(value);
     }
 };
 
@@ -36,12 +48,18 @@ pub const UUID = struct {
 
     pub fn decode(reader: anytype) !UUID {
         var uuid: UUID = undefined;
-        try reader.readNoEof(&uuid.data);
+        var total: usize = 0;
+        while (total < 16) {
+            const n = try reader.read(uuid.data[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        if (total < 16) return error.EndOfStream;
         return uuid;
     }
 
     pub fn encode(self: UUID, writer: anytype) !void {
-        try writer.writeAll(&self.data);
+        _ = try writer.write(&self.data);
     }
 
     pub fn format(
@@ -67,7 +85,7 @@ pub const UUID = struct {
 
 test "starstring encoding/decoding" {
     const testing = std.testing;
-    var list = std.ArrayList(u8){};
+    var list = std.ArrayList(u8).initCapacity(testing.allocator, 0) catch unreachable;
     defer list.deinit(testing.allocator);
 
     const test_str = "Hello Starbound!";

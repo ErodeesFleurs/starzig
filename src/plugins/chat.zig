@@ -499,7 +499,8 @@ pub const ChatPlugin = struct {
 
         var buf = std.ArrayListUnmanaged(u8){};
         defer buf.deinit(ctx.allocator);
-        try give.encode(buf.writer(ctx.allocator));
+        var w_adapter = buf.writer(ctx.allocator).adaptToNewApi(&.{});
+        try give.encode(&w_adapter.new_interface);
 
         try ctx.injectToClient(.give_item, buf.items);
         try ctx.sendMessage("Item sent.");

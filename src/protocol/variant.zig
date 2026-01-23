@@ -11,14 +11,19 @@ pub const Variant = union(enum(u8)) {
     list: []Variant = 6,
     map: std.StringArrayHashMap(Variant) = 7,
 
-    pub fn decode(allocator: std.mem.Allocator, reader: anytype) anyerror!Variant {
-        var byte_buf: [1]u8 = undefined;
-        _ = try reader.readAll(&byte_buf);
-        const tag = byte_buf[0];
+    pub fn decode(allocator: std.mem.Allocator, reader: anytype) !Variant {
+        var b: [1]u8 = undefined;
+        const n = try reader.read(&b);
+        if (n == 0) return error.EndOfStream;
+        const tag = b[0];
         return switch (tag) {
             1 => .nil,
             2 => .{ .double = @bitCast(try reader.readInt(u64, .big)) },
-            3 => .{ .boolean = (try reader.readByte()) != 0 },
+            3 => {
+                const bn = try reader.read(&b);
+                if (bn == 0) return error.EndOfStream;
+                return .{ .boolean = b[0] != 0 };
+            },
             4 => .{ .vlq = try vlq.SignedVlq.decode(reader) },
             5 => .{ .string = try types.StarString.decode(allocator, reader) },
             6 => {
@@ -76,11 +81,11 @@ pub const Variant = union(enum(u8)) {
     }
 
     pub fn encode(self: Variant, writer: anytype) !void {
-        try writer.writeByte(@intFromEnum(self));
+        try writer.writeAll(&[_]u8{@intFromEnum(self)});
         switch (self) {
             .nil => {},
             .double => |d| try writer.writeInt(u64, @bitCast(d), .big),
-            .boolean => |b| try writer.writeByte(if (b) 1 else 0),
+            .boolean => |b| try writer.writeAll(&[_]u8{if (b) 1 else 0}),
             .vlq => |v| try vlq.SignedVlq.encode(writer, v),
             .string => |s| try types.StarString.encode(writer, s),
             .list => |l| {
@@ -141,7 +146,7 @@ pub const Variant = union(enum(u8)) {
 
 test "variant encoding/decoding" {
     const testing = std.testing;
-    var list = std.ArrayList(u8){};
+    var list = std.ArrayListUnmanaged(u8){};
     defer list.deinit(testing.allocator);
 
     const v1 = Variant{ .vlq = 12345 };
@@ -156,7 +161,7 @@ test "variant encoding/decoding" {
 
 test "variant map encoding/decoding" {
     const testing = std.testing;
-    var list = std.ArrayList(u8){};
+    var list = std.ArrayListUnmanaged(u8){};
     defer list.deinit(testing.allocator);
 
     var map = std.StringArrayHashMap(Variant).init(testing.allocator);

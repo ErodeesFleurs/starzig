@@ -3,6 +3,38 @@ pub const vlq = @import("vlq.zig");
 
 pub const types = @import("types.zig");
 
+fn readExactly(reader: anytype, writer: *std.io.Writer, length: usize) !usize {
+    const ReaderType = @TypeOf(reader);
+    const PtrInfo = @typeInfo(ReaderType);
+    const T = if (PtrInfo == .pointer) PtrInfo.pointer.child else ReaderType;
+
+    if (@hasDecl(T, "vtable")) {
+        return reader.vtable.stream(@constCast(reader), writer, .limited(length));
+    } else if (ReaderType == *std.io.Reader) {
+        return reader.vtable.stream(reader, writer, .limited(length));
+    } else if (@hasDecl(T, "read")) {
+        // Generic fallback for any type that has .read()
+        var buf: [1024]u8 = undefined;
+        var total: usize = 0;
+        while (total < length) {
+            const to_read = @min(buf.len, length - total);
+            const n = try reader.read(buf[0..to_read]);
+            if (n == 0) break;
+            try writer.writeAll(buf[0..n]);
+            total += n;
+        }
+        return total;
+    } else {
+        @compileError("Unsupported reader type: " ++ @typeName(ReaderType));
+    }
+}
+
+fn readNoEof(reader: anytype, buf: []u8) !void {
+    var fw = std.io.Writer.fixed(buf);
+    const n = try readExactly(reader, &fw, buf.len);
+    if (n < buf.len) return error.EndOfStream;
+}
+
 pub const PacketType = enum(u8) {
     protocol_request = 0,
     protocol_response = 1,
@@ -52,11 +84,17 @@ pub const ModifyTileList = struct {
         errdefer allocator.free(tiles);
 
         for (0..count) |i| {
+            var b: [1]u8 = undefined;
+            var fw = std.io.Writer.fixed(&b);
+            _ = try readExactly(reader, &fw, 1);
+            const layer = b[0];
+            _ = try readExactly(reader, &fw, 1);
+            const action = b[0];
             tiles[i] = Tile{
                 .x = try reader.readInt(i32, .big),
                 .y = try reader.readInt(i32, .big),
-                .layer = try reader.readByte(),
-                .action = try reader.readByte(),
+                .layer = layer,
+                .action = action,
                 .content = try reader.readInt(u32, .big),
             };
         }
@@ -69,8 +107,8 @@ pub const ModifyTileList = struct {
         for (self.tiles) |tile| {
             try writer.writeInt(i32, tile.x, .big);
             try writer.writeInt(i32, tile.y, .big);
-            try writer.writeByte(tile.layer);
-            try writer.writeByte(tile.action);
+            _ = try writer.write(&[_]u8{tile.layer});
+            _ = try writer.write(&[_]u8{tile.action});
             try writer.writeInt(u32, tile.content, .big);
         }
     }
@@ -93,7 +131,10 @@ pub const PlayerWarp = struct {
     alias: ?[]u8 = null,
 
     pub fn decode(allocator: std.mem.Allocator, reader: anytype) !PlayerWarp {
-        const w_type = @as(WarpType, @enumFromInt(try reader.readByte()));
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const w_type = @as(WarpType, @enumFromInt(b[0]));
         var world_id: []u8 = undefined;
         var player_uuid: ?types.UUID = null;
         var alias: ?[]u8 = null;
@@ -121,7 +162,7 @@ pub const PlayerWarp = struct {
     }
 
     pub fn encode(self: PlayerWarp, writer: anytype) !void {
-        try writer.writeByte(@intFromEnum(self.warp_type));
+        _ = try writer.write(&[_]u8{@intFromEnum(self.warp_type)});
         switch (self.warp_type) {
             .to_world => try types.StarString.encode(writer, self.world_id),
             .to_player => try self.player_uuid.?.encode(writer),
@@ -161,7 +202,10 @@ pub const WorldStart = struct {
         errdefer world_properties.deinit(allocator);
 
         const client_id = try reader.readInt(u32, .big);
-        const local_interpolation_mode = (try reader.readByte()) != 0;
+        var b_mode: [1]u8 = undefined;
+        var fw_mode = std.io.Writer.fixed(&b_mode);
+        _ = try readExactly(reader, &fw_mode, 1);
+        const local_interpolation_mode = b_mode[0] != 0;
 
         return WorldStart{
             .planet = planet,
@@ -182,7 +226,7 @@ pub const WorldStart = struct {
         try writer.writeInt(u32, @bitCast(self.player_start[1]), .big);
         try self.world_properties.encode(writer);
         try writer.writeInt(u32, self.client_id, .big);
-        try writer.writeByte(if (self.local_interpolation_mode) 1 else 0);
+        try writer.writeAll(&[_]u8{if (self.local_interpolation_mode) 1 else 0});
     }
 
     pub fn deinit(self: WorldStart, allocator: std.mem.Allocator) void {
@@ -201,7 +245,10 @@ pub const GiveItem = struct {
     pub fn decode(allocator: std.mem.Allocator, reader: anytype) !GiveItem {
         const name = try types.StarString.decode(allocator, reader);
         const count = try reader.readInt(u32, .big);
-        const variant = try reader.readByte();
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const variant = b[0];
         return GiveItem{
             .name = name,
             .count = count,
@@ -212,7 +259,7 @@ pub const GiveItem = struct {
     pub fn encode(self: GiveItem, writer: anytype) !void {
         try types.StarString.encode(writer, self.name);
         try writer.writeInt(u32, self.count, .big);
-        try writer.writeByte(self.variant);
+        try writer.writeAll(&[_]u8{self.variant});
     }
 
     pub fn deinit(self: GiveItem, allocator: std.mem.Allocator) void {
@@ -232,7 +279,10 @@ pub const EntityCreate = struct {
         errdefer allocator.free(entity_type);
         const store_data = try types.StarByteArray.decode(allocator, reader);
         errdefer allocator.free(store_data);
-        const has_unique_id = (try reader.readByte()) != 0;
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const has_unique_id = b[0] != 0;
         const unique_id = if (has_unique_id) try types.StarString.decode(allocator, reader) else null;
 
         return EntityCreate{
@@ -248,10 +298,10 @@ pub const EntityCreate = struct {
         try types.StarString.encode(writer, self.entity_type);
         try types.StarByteArray.encode(writer, self.store_data);
         if (self.unique_id) |uid| {
-            try writer.writeByte(1);
+            try writer.writeAll(&[_]u8{1});
             try types.StarString.encode(writer, uid);
         } else {
-            try writer.writeByte(0);
+            try writer.writeAll(&[_]u8{0});
         }
     }
 
@@ -321,7 +371,10 @@ pub const EntityDestroy = struct {
 
     pub fn decode(reader: anytype) !EntityDestroy {
         const entity_id = try vlq.Vlq.decode(reader);
-        const death = (try reader.readByte()) != 0;
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const death = b[0] != 0;
         return EntityDestroy{
             .entity_id = entity_id,
             .death = death,
@@ -330,7 +383,7 @@ pub const EntityDestroy = struct {
 
     pub fn encode(self: EntityDestroy, writer: anytype) !void {
         try vlq.Vlq.encode(writer, self.entity_id);
-        try writer.writeByte(if (self.death) 1 else 0);
+        try writer.writeAll(&[_]u8{if (self.death) 1 else 0});
     }
 };
 
@@ -339,9 +392,11 @@ pub const PacketHeader = struct {
     payload_size: i64,
 
     pub fn decode(reader: anytype) !PacketHeader {
-        var byte_buf: [1]u8 = undefined;
-        _ = try reader.read(&byte_buf);
-        const p_type = @as(PacketType, @enumFromInt(byte_buf[0]));
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        const amt = try readExactly(reader, &fw, 1);
+        if (amt == 0) return error.EndOfStream;
+        const p_type = @as(PacketType, @enumFromInt(b[0]));
         const size = try vlq.SignedVlq.decode(reader);
 
         return PacketHeader{
@@ -351,7 +406,7 @@ pub const PacketHeader = struct {
     }
 
     pub fn encode(self: PacketHeader, writer: anytype) !void {
-        try writer.writeByte(@intFromEnum(self.packet_type));
+        try writer.writeAll(&[_]u8{@intFromEnum(self.packet_type)});
         try vlq.SignedVlq.encode(writer, self.payload_size);
     }
 };
@@ -371,9 +426,10 @@ pub const ChatHeader = struct {
     client_id: u16,
 
     pub fn decode(allocator: std.mem.Allocator, reader: anytype) !ChatHeader {
-        var byte_buf: [1]u8 = undefined;
-        _ = try reader.read(&byte_buf);
-        const mode = byte_buf[0];
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const mode = b[0];
         var channel: []u8 = undefined;
         var client_id: u16 = 0;
 
@@ -382,7 +438,7 @@ pub const ChatHeader = struct {
             client_id = try reader.readInt(u16, .big);
         } else {
             channel = try allocator.dupe(u8, "");
-            _ = try reader.read(&byte_buf); // junk
+            _ = try readExactly(reader, &fw, 1); // junk
             client_id = try reader.readInt(u16, .big);
         }
 
@@ -394,12 +450,12 @@ pub const ChatHeader = struct {
     }
 
     pub fn encode(self: ChatHeader, writer: anytype) !void {
-        try writer.writeByte(self.mode);
+        try writer.writeAll(&[_]u8{self.mode});
         if (self.mode == 0 or self.mode == 1) {
             try types.StarString.encode(writer, self.channel);
             try writer.writeInt(u16, self.client_id, .big);
         } else {
-            try writer.writeByte(0);
+            try writer.writeAll(&[_]u8{0});
             try writer.writeInt(u16, self.client_id, .big);
         }
     }
@@ -420,7 +476,10 @@ pub const ChatReceived = struct {
         errdefer header.deinit(allocator);
         const name = try types.StarString.decode(allocator, reader);
         errdefer allocator.free(name);
-        const junk = try reader.readByte();
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const junk = b[0];
         const message = try types.StarString.decode(allocator, reader);
 
         return ChatReceived{
@@ -434,7 +493,7 @@ pub const ChatReceived = struct {
     pub fn encode(self: ChatReceived, writer: anytype) !void {
         try self.header.encode(writer);
         try types.StarString.encode(writer, self.name);
-        try writer.writeByte(self.junk);
+        try writer.writeAll(&[_]u8{self.junk});
         try types.StarString.encode(writer, self.message);
     }
 
@@ -451,13 +510,16 @@ pub const ChatSent = struct {
 
     pub fn decode(allocator: std.mem.Allocator, reader: anytype) !ChatSent {
         const message = try types.StarString.decode(allocator, reader);
-        const mode = try reader.readByte();
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const mode = b[0];
         return ChatSent{ .message = message, .send_mode = mode };
     }
 
     pub fn encode(self: ChatSent, writer: anytype) !void {
         try types.StarString.encode(writer, self.message);
-        try writer.writeByte(self.send_mode);
+        try writer.writeAll(&[_]u8{self.send_mode});
     }
 
     pub fn deinit(self: ChatSent, allocator: std.mem.Allocator) void {
@@ -479,14 +541,17 @@ pub const WorldChunks = struct {
             const v1 = try vlq.Vlq.decode(reader);
             const c1 = try allocator.alloc(u8, v1);
             defer allocator.free(c1);
-            try reader.readNoEof(c1);
+            try readNoEof(reader, c1);
 
-            const sep = try reader.readByte();
+            var b: [1]u8 = undefined;
+            var fw = std.io.Writer.fixed(&b);
+            _ = try readExactly(reader, &fw, 1);
+            const sep = b[0];
 
             const v2 = try vlq.Vlq.decode(reader);
             const c2 = try allocator.alloc(u8, v2);
             defer allocator.free(c2);
-            try reader.readNoEof(c2);
+            try readNoEof(reader, c2);
 
             try vlq.Vlq.encode(list.writer(allocator), v1);
             try list.appendSlice(allocator, c1);
@@ -530,7 +595,10 @@ pub const ClientConnect = struct {
     pub fn decode(allocator: std.mem.Allocator, reader: anytype) !ClientConnect {
         const asset_digest = try types.StarByteArray.decode(allocator, reader);
         errdefer allocator.free(asset_digest);
-        const allow_mismatch = (try reader.readByte()) != 0;
+        var b: [1]u8 = undefined;
+        var fw = std.io.Writer.fixed(&b);
+        _ = try readExactly(reader, &fw, 1);
+        const allow_mismatch = b[0] != 0;
         const uuid = try types.UUID.decode(reader);
         const name = try types.StarString.decode(allocator, reader);
         errdefer allocator.free(name);
@@ -555,7 +623,10 @@ pub const ClientConnect = struct {
             ship_capabilities[i] = try types.StarString.decode(allocator, reader);
         }
 
-        const intro_complete = (try reader.readByte()) != 0;
+        var b_intro: [1]u8 = undefined;
+        var fw_intro = std.io.Writer.fixed(&b_intro);
+        _ = try readExactly(reader, &fw_intro, 1);
+        const intro_complete = b_intro[0] != 0;
         const account = try types.StarString.decode(allocator, reader);
 
         return ClientConnect{
@@ -578,7 +649,7 @@ pub const ClientConnect = struct {
 
     pub fn encode(self: ClientConnect, writer: anytype) !void {
         try types.StarByteArray.encode(writer, self.asset_digest);
-        try writer.writeByte(if (self.allow_mismatch) 1 else 0);
+        try writer.writeAll(&[_]u8{if (self.allow_mismatch) 1 else 0});
         try self.uuid.encode(writer);
         try types.StarString.encode(writer, self.name);
         try types.StarString.encode(writer, self.species);
@@ -594,7 +665,7 @@ pub const ClientConnect = struct {
             try types.StarString.encode(writer, cap);
         }
 
-        try writer.writeByte(if (self.intro_complete) 1 else 0);
+        try writer.writeAll(&[_]u8{if (self.intro_complete) 1 else 0});
         try types.StarString.encode(writer, self.account);
     }
 

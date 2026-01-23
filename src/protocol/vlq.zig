@@ -6,10 +6,29 @@ const std = @import("std");
 pub const Vlq = struct {
     pub fn decode(reader: anytype) !u64 {
         var value: u64 = 0;
+        const ReaderType = @TypeOf(reader);
+        const PtrInfo = @typeInfo(ReaderType);
+        const T = if (PtrInfo == .pointer) PtrInfo.pointer.child else ReaderType;
+
         while (true) {
-            var buf: [1]u8 = undefined;
-            try reader.readNoEof(&buf);
-            const byte = buf[0];
+            const byte = if (@hasDecl(T, "vtable")) blk: {
+                var b: [1]u8 = undefined;
+                var fw = std.io.Writer.fixed(&b);
+                const n = try reader.vtable.stream(@constCast(reader), &fw, .limited(1));
+                if (n == 0) return error.EndOfStream;
+                break :blk b[0];
+            } else if (ReaderType == *std.io.Reader) blk: {
+                var b: [1]u8 = undefined;
+                var fw = std.io.Writer.fixed(&b);
+                const n = try reader.vtable.stream(reader, &fw, .limited(1));
+                if (n == 0) return error.EndOfStream;
+                break :blk b[0];
+            } else blk: {
+                var b: [1]u8 = undefined;
+                const n = try reader.read(&b);
+                if (n == 0) return error.EndOfStream;
+                break :blk b[0];
+            };
             value = (value << 7) | (byte & 0x7F);
             if (byte & 0x80 == 0) break;
         }
@@ -64,7 +83,7 @@ pub const SignedVlq = struct {
 
 test "vlq encoding/decoding" {
     const testing = std.testing;
-    var list = std.ArrayList(u8){};
+    var list = std.ArrayList(u8).initCapacity(testing.allocator, 0) catch unreachable;
     defer list.deinit(testing.allocator);
 
     try Vlq.encode(list.writer(testing.allocator), 127);
@@ -85,7 +104,7 @@ test "vlq encoding/decoding" {
 
 test "signed vlq encoding/decoding" {
     const testing = std.testing;
-    var list = std.ArrayList(u8){};
+    var list = std.ArrayList(u8).initCapacity(testing.allocator, 0) catch unreachable;
     defer list.deinit(testing.allocator);
 
     try SignedVlq.encode(list.writer(testing.allocator), -1);

@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibC();
     exe.linkSystemLibrary("zstd");
+    exe.linkSystemLibrary("z");
 
     b.installArtifact(exe);
 
@@ -35,6 +36,7 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.linkLibC();
     unit_tests.linkSystemLibrary("zstd");
+    unit_tests.linkSystemLibrary("z");
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");

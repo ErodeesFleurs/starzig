@@ -51,7 +51,13 @@ pub const EntityManagerPlugin = struct {
             const update_len = try packet.vlq.Vlq.decode(reader);
             const update_data = try ctx.allocator.alloc(u8, update_len);
             defer ctx.allocator.free(update_data);
-            try reader.readNoEof(update_data);
+            var total: usize = 0;
+            while (total < update_len) {
+                const n = try reader.read(update_data[total..]);
+                if (n == 0) break;
+                total += n;
+            }
+            if (total < update_len) return error.EndOfStream;
 
             if (ctx.entities.get(entity_id)) |info| {
                 if (update_data.len >= 8) {
