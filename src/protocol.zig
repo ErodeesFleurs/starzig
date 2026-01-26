@@ -1,7 +1,7 @@
 const std = @import("std");
 
-pub const VLQ = struct {
-    pub fn decode(data: []const u8) !struct { value: u64, bytes_read: usize } {
+pub const Protocol = struct {
+    pub fn decodeVLQ(data: []const u8) !struct { value: u64, bytes_read: usize } {
         if (data.len == 0) return error.Incomplete;
 
         var value: u64 = 0;
@@ -25,8 +25,8 @@ pub const VLQ = struct {
         return error.Incomplete;
     }
 
-    pub fn decodeSigned(data: []const u8) !struct { value: i64, bytes_read: usize } {
-        const res = try decode(data);
+    pub fn decodeSignedVLQ(data: []const u8) !struct { value: i64, bytes_read: usize } {
+        const res = try decodeVLQ(data);
         const sign: i64 = @as(i64, 1) - 2 * @as(i64, @intCast(res.value & 1));
         const abs_value = (res.value >> 1) + @as(u64, res.value & 1);
 
@@ -36,7 +36,7 @@ pub const VLQ = struct {
         };
     }
 
-    pub fn encode(allocator: std.mem.Allocator, obj: u64) ![]u8 {
+    pub fn encodeVLQ(allocator: std.mem.Allocator, obj: u64) ![]u8 {
         if (obj == 0) {
             const res = try allocator.alloc(u8, 1);
             res[0] = 0;
@@ -64,5 +64,11 @@ pub const VLQ = struct {
         }
 
         return result.toOwnedSlice();
+    }
+
+    pub fn decompressPayload(gpa: std.mem.Allocator, compressed_data: []const u8) ![]u8 {
+        var fbs = std.io.Reader.fixed(compressed_data);
+        var decompressor: std.compress.flate.Decompress = .init(&fbs, .zlib, &.{});
+        return try decompressor.reader.allocRemaining(gpa, .unlimited);
     }
 };
