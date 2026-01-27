@@ -3,6 +3,11 @@ const posix = std.posix;
 const protocol = @import("protocol.zig");
 const RingBuffer = @import("ring_buffer.zig").RingBuffer;
 
+pub const SessionState = enum {
+    Handshaking,
+    Forwarding,
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     client_fd: posix.socket_t,
@@ -10,6 +15,12 @@ pub const Session = struct {
     client_buf: RingBuffer,
     server_buf: RingBuffer,
     decompress_buf: std.ArrayList(u8),
+
+    client_out_queue: std.ArrayList(u8),
+    server_out_queue: std.ArrayList(u8),
+
+    last_active_ms: i64,
+    state: SessionState = .Handshaking,
 
     pub fn init(gpa: std.mem.Allocator, c_fd: posix.socket_t, s_fd: posix.socket_t) !*Session {
         const self = try gpa.create(Session);
@@ -19,10 +30,13 @@ pub const Session = struct {
             .allocator = gpa,
             .client_fd = c_fd,
             .server_fd = s_fd,
-            // 增加缓冲区大小到 1MB 以支持大型数据包（如世界数据）
             .client_buf = try RingBuffer.init(gpa, 1024 * 1024),
             .server_buf = try RingBuffer.init(gpa, 1024 * 1024),
             .decompress_buf = std.ArrayList(u8).empty,
+            .client_out_queue = std.ArrayList(u8).empty,
+            .server_out_queue = std.ArrayList(u8).empty,
+            .last_active_ms = std.time.milliTimestamp(),
+            .state = .Handshaking,
         };
         return self;
     }
@@ -31,30 +45,75 @@ pub const Session = struct {
         self.client_buf.deinit(self.allocator);
         self.server_buf.deinit(self.allocator);
         self.decompress_buf.deinit(self.allocator);
+        self.client_out_queue.deinit(self.allocator);
+        self.server_out_queue.deinit(self.allocator);
         posix.close(self.client_fd);
         posix.close(self.server_fd);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
 
-    fn writeAll(fd: posix.socket_t, data: []const u8) !void {
-        var written: usize = 0;
-        while (written < data.len) {
-            const n = posix.write(fd, data[written..]) catch |err| {
-                if (err == error.WouldBlock) {
-                    std.Thread.yield() catch {};
-                    continue;
-                }
-                return err;
-            };
-            if (n == 0) return error.Closed;
-            written += n;
+    pub fn markActive(self: *Session) void {
+        self.last_active_ms = std.time.milliTimestamp();
+    }
+
+    pub fn send(self: *Session, dest_fd: posix.socket_t, data: []const u8) !void {
+        self.markActive();
+        const queue = if (dest_fd == self.client_fd) &self.client_out_queue else &self.server_out_queue;
+        if (queue.items.len > 0) {
+            try queue.appendSlice(self.allocator, data);
+            return;
         }
+
+        const n = posix.write(dest_fd, data) catch |err| {
+            if (err == error.WouldBlock) {
+                try queue.appendSlice(self.allocator, data);
+                return;
+            }
+            return err;
+        };
+
+        if (n < data.len) {
+            try queue.appendSlice(self.allocator, data[n..]);
+        }
+    }
+
+    pub fn flush(self: *Session, fd: posix.socket_t) !void {
+        self.markActive();
+        const queue = if (fd == self.client_fd) &self.client_out_queue else &self.server_out_queue;
+        if (queue.items.len == 0) return;
+
+        const n = posix.write(fd, queue.items) catch |err| {
+            if (err == error.WouldBlock) return;
+            return err;
+        };
+
+        if (n > 0) {
+            try queue.replaceRange(self.allocator, 0, n, &[_]u8{});
+        }
+    }
+
+    pub fn hasPendingData(self: *Session, fd: posix.socket_t) bool {
+        const queue = if (fd == self.client_fd) &self.client_out_queue else &self.server_out_queue;
+        return queue.items.len > 0;
+    }
+
+    fn processHandshakePacket(self: *Session, is_client: bool, packet_id: i8, full_packet: []const u8) !void {
+        const dest_fd = if (is_client) self.server_fd else self.client_fd;
+        const direction = if (is_client) "C -> S" else "S -> C";
+
+        std.debug.print("[Handshake][{s}] Packet ID: {d}, Len: {d}\n", .{ direction, packet_id, full_packet.len });
+
+        if (!is_client and packet_id == 3) {
+            std.debug.print("Handshake completed successfully.\n", .{});
+            self.state = .Forwarding;
+        }
+
+        try self.send(dest_fd, full_packet);
     }
 
     pub fn handleData(self: *Session, src_fd: posix.socket_t) !void {
         const is_client = (src_fd == self.client_fd);
-        const dest_fd = if (is_client) self.server_fd else self.client_fd;
         const buffer = if (is_client) &self.client_buf else &self.server_buf;
 
         const w_slice = buffer.writeSlice();
@@ -65,13 +124,13 @@ pub const Session = struct {
             return err;
         };
         if (n == 0) return error.Closed;
+        self.markActive();
         buffer.advanceWrite(n);
 
         while (true) {
             const avail = buffer.readableLen();
             if (avail < 2) break;
 
-            // 线性化以读取 ID 和第一个 VarInt 字节
             const peek_data = try buffer.linearize(@min(avail, 16));
             const packet_id = @as(i8, @bitCast(peek_data[0]));
 
@@ -87,20 +146,26 @@ pub const Session = struct {
 
             if (avail < packet_size) break;
 
-            // 线性化完整包以供后续处理
             const full_packet = try buffer.linearize(packet_size);
-            const payload = full_packet[header_size..];
 
-            if (packet_compressed) {
-                try protocol.compressor.decompressToArrayList(payload, &self.decompress_buf, self.allocator);
+            if (self.state == .Handshaking) {
+                try self.processHandshakePacket(is_client, packet_id, full_packet);
+                buffer.advanceRead(packet_size);
+                return;
+            } else {
+                // 通用高效转发模式
+                const dest_fd = if (is_client) self.server_fd else self.client_fd;
+                const direction = if (is_client) "C -> S" else "S -> C";
+
+                if (packet_compressed) {
+                    const payload = full_packet[header_size..];
+                    try protocol.compressor.decompressToArrayList(payload, &self.decompress_buf, self.allocator);
+                }
+
+                std.debug.print("[{s}] Packet ID: {d}, Len: {d}\n", .{ direction, packet_id, packet_size });
+                try self.send(dest_fd, full_packet);
+                buffer.advanceRead(packet_size);
             }
-
-            const direction = if (is_client) "C -> S" else "S -> C";
-            std.debug.print("[{s}] Packet ID: {d}, Len: {d}\n", .{ direction, packet_id, packet_size });
-
-            // 使用 writeAll 确保数据不被截断，防止服务端报 TcpPacketSocket 错误
-            try writeAll(dest_fd, full_packet);
-            buffer.advanceRead(packet_size);
         }
     }
 };

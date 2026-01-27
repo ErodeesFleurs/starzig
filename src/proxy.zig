@@ -10,6 +10,8 @@ pub const Proxy = struct {
     sessions: std.AutoHashMap(posix.socket_t, *Session),
     poll_fds: std.ArrayList(posix.pollfd),
 
+    const TIMEOUT_MS = 60000; // 60秒无活动则断开
+
     pub fn init(allocator: std.mem.Allocator, listen_ip: []const u8, listen_port: u16, target_ip: []const u8, target_port: u16) !Proxy {
         const listen_addr = try net.Address.parseIp(listen_ip, listen_port);
         const target_addr = try net.Address.parseIp(target_ip, target_port);
@@ -37,8 +39,15 @@ pub const Proxy = struct {
 
     pub fn deinit(self: *Proxy) void {
         var it = self.sessions.valueIterator();
+        var seen = std.AutoHashMap(*Session, void).init(self.allocator);
+        defer seen.deinit();
+
         while (it.next()) |session_ptr| {
-            session_ptr.*.deinit();
+            const session = session_ptr.*;
+            if (seen.get(session) == null) {
+                session.deinit();
+                seen.put(session, {}) catch {};
+            }
         }
         self.sessions.deinit();
         self.poll_fds.deinit(self.allocator);
@@ -49,30 +58,83 @@ pub const Proxy = struct {
         std.debug.print("StarryPy-Zig Proxy started...\n", .{});
 
         while (true) {
-            const ready_count = try posix.poll(self.poll_fds.items, -1);
-            if (ready_count == 0) continue;
-
-            var i: usize = self.poll_fds.items.len;
-            while (i > 0) {
-                i -= 1;
-                const pfd = &self.poll_fds.items[i];
-
-                if (pfd.revents == 0) continue;
-
-                if (pfd.fd == self.listener.stream.handle) {
-                    if (pfd.revents & posix.POLL.IN != 0) {
-                        self.acceptClient() catch |err| {
-                            std.debug.print("Failed to accept client: {}\n", .{err});
-                        };
-                    }
-                } else {
-                    if (self.sessions.get(pfd.fd)) |session| {
-                        session.handleData(pfd.fd) catch {
-                            self.cleanupSession(session);
-                        };
+            // 在 poll 之前，根据发送队列状态更新 events
+            for (self.poll_fds.items) |*pfd| {
+                if (pfd.fd == self.listener.stream.handle) continue;
+                if (self.sessions.get(pfd.fd)) |session| {
+                    pfd.events = posix.POLL.IN;
+                    if (session.hasPendingData(pfd.fd)) {
+                        pfd.events |= posix.POLL.OUT;
                     }
                 }
             }
+
+            const ready_count = try posix.poll(self.poll_fds.items, 1000); // 1秒超时以执行维护任务
+
+            if (ready_count > 0) {
+                var i: usize = self.poll_fds.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const pfd = &self.poll_fds.items[i];
+                    if (pfd.revents == 0) continue;
+
+                    if (pfd.fd == self.listener.stream.handle) {
+                        if (pfd.revents & posix.POLL.IN != 0) {
+                            self.acceptClient() catch |err| {
+                                std.debug.print("Failed to accept client: {}\n", .{err});
+                            };
+                        }
+                    } else if (self.sessions.get(pfd.fd)) |session| {
+                        // 处理可写事件 (Flush)
+                        if (pfd.revents & posix.POLL.OUT != 0) {
+                            session.flush(pfd.fd) catch {
+                                self.cleanupSession(session);
+                                continue;
+                            };
+                        }
+                        // 处理可读事件
+                        if (pfd.revents & posix.POLL.IN != 0) {
+                            session.handleData(pfd.fd) catch {
+                                self.cleanupSession(session);
+                                continue;
+                            };
+                        }
+                        // 处理错误
+                        if (pfd.revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) {
+                            self.cleanupSession(session);
+                        }
+                    }
+                }
+            }
+
+            // 定时清理超时会话
+            try self.checkTimeouts();
+        }
+    }
+
+    fn checkTimeouts(self: *Proxy) !void {
+        const now = std.time.milliTimestamp();
+        var it = self.sessions.valueIterator();
+
+        var to_remove = std.ArrayList(*Session).empty;
+        defer to_remove.deinit(self.allocator);
+
+        var seen = std.AutoHashMap(*Session, void).init(self.allocator);
+        defer seen.deinit();
+
+        while (it.next()) |session_ptr| {
+            const session = session_ptr.*;
+            if (seen.get(session) != null) continue;
+            try seen.put(session, {});
+
+            if (now - session.last_active_ms > TIMEOUT_MS) {
+                try to_remove.append(self.allocator, session);
+            }
+        }
+
+        for (to_remove.items) |session| {
+            std.debug.print("Session timeout: {} <-> {}\n", .{ session.client_fd, session.server_fd });
+            self.cleanupSession(session);
         }
     }
 
@@ -104,7 +166,6 @@ pub const Proxy = struct {
         _ = self.sessions.remove(c_fd);
         _ = self.sessions.remove(s_fd);
 
-        // Remove from poll_fds
         var i: usize = 0;
         while (i < self.poll_fds.items.len) {
             const fd = self.poll_fds.items[i].fd;
