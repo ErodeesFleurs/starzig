@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const VLQ = struct {
+pub const vlq = struct {
     pub fn decode(data: []const u8) !struct { value: u64, bytes_read: usize } {
         if (data.len == 0) return error.Incomplete;
 
@@ -44,7 +44,7 @@ pub const VLQ = struct {
         }
 
         var result = std.ArrayList(u8).empty;
-        errdefer result.deinit();
+        errdefer result.deinit(allocator);
         var value = obj;
 
         while (value > 0) {
@@ -53,7 +53,7 @@ pub const VLQ = struct {
             if (result.items.len > 0) {
                 byte |= 0x80;
             }
-            try result.append(byte);
+            try result.append(allocator, byte);
         }
 
         std.mem.reverse(u8, result.items);
@@ -63,6 +63,6 @@ pub const VLQ = struct {
             result.items[result.items.len - 1] &= 0x7F;
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(allocator);
     }
 };
